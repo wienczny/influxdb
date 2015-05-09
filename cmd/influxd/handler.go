@@ -10,15 +10,11 @@ import (
 
 	"github.com/influxdb/influxdb"
 	"github.com/influxdb/influxdb/httpd"
-	"github.com/influxdb/influxdb/messaging"
-	"github.com/influxdb/influxdb/raft"
 )
 
 // Handler represents an HTTP handler for InfluxDB node.
 // Depending on its role, it will serve many different endpoints.
 type Handler struct {
-	Log    *raft.Log
-	Broker *influxdb.Broker
 	Server *influxdb.Server
 	Config *Config
 }
@@ -45,20 +41,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Broker raft communication endpoints.  These are called and handled by brokers
-	// to coordinate changes to the raft log.
-	if strings.HasPrefix(r.URL.Path, "/raft") {
-		h.serveRaft(w, r)
-		return
-	}
-
-	// Broker messaging endpoints.  These are handled by brokers and called by data
-	// nodes to receive topic change and update replication status.
-	if strings.HasPrefix(r.URL.Path, "/messaging") {
-		h.serveMessaging(w, r)
-		return
-	}
-
 	// Data node endpoints.  These are handled by data nodes and allow brokers and data
 	// nodes to transfer state, process queries, etc..
 	if strings.HasPrefix(r.URL.Path, "/data") {
@@ -70,95 +52,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveAPI(w, r)
 }
 
-// serveMessaging responds to broker requests
-func (h *Handler) serveMessaging(w http.ResponseWriter, r *http.Request) {
-	if h.Broker == nil && h.Server == nil {
-		log.Println("no broker or server configured to handle messaging endpoints")
-		http.Error(w, "server unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	// If we're running a broker, handle the broker endpoints
-	if h.Broker != nil {
-		mh := &messaging.Handler{
-			Broker:      h.Broker.Broker,
-			RaftHandler: &raft.Handler{Log: h.Log},
-		}
-		mh.ServeHTTP(w, r)
-		return
-	}
-
-	// Redirect to a valid broker to handle the request
-	h.redirect(h.Server.BrokerURLs(), w, r)
-}
-
 // serveData responds to broker requests
 func (h *Handler) serveData(w http.ResponseWriter, r *http.Request) {
-	if h.Broker == nil && h.Server == nil {
-		log.Println("no broker or server configured to handle metadata endpoints")
+	if h.Server == nil {
+		log.Println("no server configured to handle metadata endpoints")
 		http.Error(w, "server unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	if h.Server != nil {
-		sh := httpd.NewClusterHandler(h.Server, h.Config.Authentication.Enabled,
-			h.Config.Snapshot.Enabled, h.Config.Logging.HTTPAccess, version)
-		sh.ServeHTTP(w, r)
-		return
-	}
-
-	t := h.Broker.Topic(influxdb.BroadcastTopicID)
-	if t == nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-
-	// Redirect to a valid data URL to handle the request
-	h.redirect(h.Broker.Topic(influxdb.BroadcastTopicID).DataURLs(), w, r)
-}
-
-// serveRaft responds to raft requests.
-func (h *Handler) serveRaft(w http.ResponseWriter, r *http.Request) {
-	if h.Log == nil && h.Server == nil {
-		log.Println("no broker or server configured to handle raft endpoints")
-		http.Error(w, "server unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	if h.Log != nil {
-		rh := raft.Handler{Log: h.Log}
-		rh.ServeHTTP(w, r)
-		return
-	}
-
-	// Redirect to a valid broker to handle the request
-	h.redirect(h.Server.BrokerURLs(), w, r)
+	sh := httpd.NewClusterHandler(h.Server, h.Config.Authentication.Enabled,
+		h.Config.Snapshot.Enabled, h.Config.Logging.HTTPAccess, version)
+	sh.ServeHTTP(w, r)
+	return
 }
 
 // serveAPI responds to data requests
 func (h *Handler) serveAPI(w http.ResponseWriter, r *http.Request) {
-	if h.Broker == nil && h.Server == nil {
-		log.Println("no broker or server configured to handle data endpoints")
+	if h.Server == nil {
+		log.Println("no server configured to handle data endpoints")
 		http.Error(w, "server unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	if h.Server != nil {
-		sh := httpd.NewAPIHandler(h.Server, h.Config.Authentication.Enabled,
-			h.Config.Logging.HTTPAccess, version)
-		sh.WriteTrace = h.Config.Logging.WriteTracing
-		sh.ServeHTTP(w, r)
-		return
-	}
-
-	t := h.Broker.Topic(influxdb.BroadcastTopicID)
-	if t == nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-
-	// Redirect to a valid data URL to handle the request
-	h.redirect(h.Broker.Topic(influxdb.BroadcastTopicID).DataURLs(), w, r)
+	sh := httpd.NewAPIHandler(h.Server, h.Config.Authentication.Enabled,
+		h.Config.Logging.HTTPAccess, version)
+	sh.WriteTrace = h.Config.Logging.WriteTracing
+	sh.ServeHTTP(w, r)
+	return
 }
 
 // redirect redirects a request to URL in u.  If u is an empty slice,

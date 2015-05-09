@@ -22,7 +22,7 @@ import (
 
 	"github.com/influxdb/influxdb/data"
 	"github.com/influxdb/influxdb/influxql"
-	"github.com/influxdb/influxdb/messaging"
+
 	"github.com/influxdb/influxdb/meta"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -65,12 +65,12 @@ type Service interface {
 
 // QueryExecutor executes a query across multiple data nodes
 type QueryExecutor interface {
-	Execute(q *QueryRequest) (chan *Result, error)
+	Execute(q *QueryRequest) chan *Result
 }
 
 // QueryRequest represent a request to run a query across the cluster
 type QueryRequest struct {
-	Query     *influxql.Query
+	Statement influxql.Statement
 	Database  string
 	User      *User
 	ChunkSize int
@@ -99,7 +99,6 @@ type Server struct {
 	rpDone   chan struct{} // retention policies goroutine close notification
 	sgpcDone chan struct{} // shard group pre-create goroutine close notification
 
-	client MessagingClient  // broker client
 	index  uint64           // highest broadcast index seen
 	errors map[uint64]error // message errors
 
@@ -141,20 +140,29 @@ type Server struct {
 	dn data.Node
 
 	// The meta store for accessing and updating cluster and schema data
-	ms meta.Store
+	MetaStore meta.Store
 
 	// The services running on this node
 	services []Service
 
 	// Handles write request for local and remote nodes
-	pw PointsWriter
+	PointsWriter PointsWriter
 
 	// Handles queries for local and remote nodes
-	qe QueryExecutor
+	QueryExecutor QueryExecutor
 }
 
 // NewServer returns a new instance of Server.
 func NewServer() *Server {
+
+	// FIXME: setup a metastore
+	var ms meta.Store
+
+	// FIXME: setup a Coordinator (PointsWriter, QueryExecutor)
+	c := &Coordinator{
+		MetaStore: ms,
+	}
+
 	s := Server{
 		meta:      &metastore{},
 		errors:    make(map[uint64]error),
@@ -162,16 +170,18 @@ func NewServer() *Server {
 		databases: make(map[string]*database),
 		users:     make(map[string]*User),
 
-		shards: make(map[uint64]*Shard),
-		stats:  NewStats("server"),
-		Logger: log.New(os.Stderr, "[server] ", log.LstdFlags),
-		pw:     &Coordinator{},
-		qe:     &Coordinator{},
+		shards:        make(map[uint64]*Shard),
+		stats:         NewStats("server"),
+		Logger:        log.New(os.Stderr, "[server] ", log.LstdFlags),
+		PointsWriter:  c,
+		QueryExecutor: c,
+		MetaStore:     ms,
 	}
 	// Server will always return with authentication enabled.
 	// This ensures that disabling authentication must be an explicit decision.
 	// To set the server to 'authless mode', call server.SetAuthenticationEnabled(false).
 	s.authenticationEnabled = true
+
 	return &s
 }
 
@@ -191,10 +201,6 @@ func (s *Server) closeServices() error {
 		}
 	}
 	return nil
-}
-
-func (s *Server) BrokerURLs() []url.URL {
-	return s.client.URLs()
 }
 
 // SetAuthenticationEnabled turns on or off server authentication
@@ -242,7 +248,7 @@ func (s *Server) metaPath() string {
 }
 
 // Open initializes the server from a given path.
-func (s *Server) Open(path string, client MessagingClient) error {
+func (s *Server) Open(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -266,9 +272,6 @@ func (s *Server) Open(path string, client MessagingClient) error {
 		return err
 	}
 
-	// Set the messaging client.
-	s.client = client
-
 	// Open metadata store.
 	if err := s.meta.open(s.metaPath()); err != nil {
 		_ = s.close()
@@ -281,17 +284,9 @@ func (s *Server) Open(path string, client MessagingClient) error {
 		return fmt.Errorf("load: %s", err)
 	}
 
-	// Create connection for broadcast topic.
-	conn := client.Conn(BroadcastTopicID)
-	if err := conn.Open(s.index, true); err != nil {
-		_ = s.close()
-		return fmt.Errorf("open conn: %s", err)
-	}
-
 	// Begin streaming messages from broadcast topic.
 	done := make(chan struct{}, 0)
 	s.done = done
-	go s.processor(conn, done)
 
 	// TODO: Associate series ids with shards.
 
@@ -335,11 +330,6 @@ func (s *Server) close() error {
 	if s.done != nil {
 		close(s.done)
 		s.done = nil
-	}
-
-	if s.client != nil {
-		s.client.Close()
-		s.client = nil
 	}
 
 	// Close metastore.
@@ -402,7 +392,7 @@ func (s *Server) load() error {
 							continue
 						}
 
-						if err := sh.open(s.shardPath(sh.ID), s.client.Conn(sh.ID)); err != nil {
+						if err := sh.open(s.shardPath(sh.ID)); err != nil {
 							return fmt.Errorf("cannot open shard store: id=%d, err=%s", sh.ID, err)
 						}
 						s.stats.Inc("shardsOpen")
@@ -616,42 +606,6 @@ func (s *Server) ShardGroupPreCreate(checkInterval time.Duration) {
 			log.Printf("failed to request pre-creation of shard group %d for time %s: %s", g.ID, g.Timestamp, err.Error())
 		}
 	}
-}
-
-// Client retrieves the current messaging client.
-func (s *Server) Client() MessagingClient {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.client
-}
-
-// broadcast encodes a message as JSON and send it to the broker's broadcast topic.
-// This function waits until the message has been processed by the server.
-// Returns the broker log index of the message or an error.
-func (s *Server) broadcast(typ messaging.MessageType, c interface{}) (uint64, error) {
-	s.stats.Inc("broadcastMessageTx")
-
-	// Encode the command.
-	data, err := json.Marshal(c)
-	if err != nil {
-		return 0, err
-	}
-
-	// Publish the message.
-	m := &messaging.Message{
-		Type:    typ,
-		TopicID: BroadcastTopicID,
-		Data:    data,
-	}
-	index, err := s.client.Publish(m)
-	if err != nil {
-		return 0, err
-	}
-
-	// Wait for the server to receive the message.
-	err = s.Sync(BroadcastTopicID, index)
-
-	return index, err
 }
 
 // Sync blocks until a given index (or a higher index) has been applied.
@@ -968,67 +922,13 @@ func (s *Server) DataNodes() (a []*DataNode) {
 
 // CreateDataNode creates a new data node with a given URL.
 func (s *Server) CreateDataNode(u *url.URL) error {
-	c := &createDataNodeCommand{URL: u.String()}
-	_, err := s.broadcast(createDataNodeMessageType, c)
+	_, err := s.MetaStore.CreateNode(u.Host)
 	return err
-}
-
-func (s *Server) applyCreateDataNode(m *messaging.Message) (err error) {
-	var c createDataNodeCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Validate parameters.
-	if c.URL == "" {
-		return ErrDataNodeURLRequired
-	}
-
-	// Check that another node with the same URL doesn't already exist.
-	u, _ := url.Parse(c.URL)
-	for _, n := range s.dataNodes {
-		if n.URL.String() == u.String() {
-			return ErrDataNodeExists
-		}
-	}
-
-	// Create data node.
-	n := newDataNode()
-	n.URL = u
-
-	// Persist to metastore.
-	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		n.ID = tx.nextDataNodeID()
-		return tx.saveDataNode(n)
-	})
-
-	// Add to node on server.
-	s.dataNodes[n.ID] = n
-
-	return
 }
 
 // DeleteDataNode deletes an existing data node.
 func (s *Server) DeleteDataNode(id uint64) error {
-	c := &deleteDataNodeCommand{ID: id}
-	_, err := s.broadcast(deleteDataNodeMessageType, c)
-	return err
-}
-
-func (s *Server) applyDeleteDataNode(m *messaging.Message) (err error) {
-	var c deleteDataNodeCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	n := s.dataNodes[c.ID]
-	if n == nil {
-		return ErrDataNodeNotFound
-	}
-
-	// Remove from metastore.
-	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error { return tx.deleteDataNode(c.ID) })
-
-	// Delete the node.
-	delete(s.dataNodes, n.ID)
-
-	return
+	return s.MetaStore.DeleteNode(id)
 }
 
 // DatabaseExists returns true if a database exists.
@@ -1054,8 +954,7 @@ func (s *Server) CreateDatabase(name string) error {
 	if name == "" {
 		return ErrDatabaseNameRequired
 	}
-	c := &createDatabaseCommand{Name: name}
-	_, err := s.broadcast(createDatabaseMessageType, c)
+	_, err := s.MetaStore.CreateDatabase(name)
 	return err
 }
 
@@ -1072,93 +971,13 @@ func (s *Server) CreateDatabaseIfNotExists(name string) error {
 	return nil
 }
 
-func (s *Server) applyCreateDatabase(m *messaging.Message) (err error) {
-	var c createDatabaseCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	if s.databases[c.Name] != nil {
-		return ErrDatabaseExists
-	}
-
-	// Create database entry.
-	db := newDatabase()
-	db.name = c.Name
-
-	if s.RetentionAutoCreate {
-		// Create the default retention policy.
-		db.policies[DefaultRetentionPolicyName] = &RetentionPolicy{
-			Name:               DefaultRetentionPolicyName,
-			Duration:           0,
-			ShardGroupDuration: calculateShardGroupDuration(0),
-			ReplicaN:           1,
-		}
-		db.defaultRetentionPolicy = DefaultRetentionPolicyName
-		s.Logger.Printf("retention policy '%s' auto-created for database '%s'", DefaultRetentionPolicyName, c.Name)
-	}
-
-	// Persist to metastore.
-	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error { return tx.saveDatabase(db) })
-
-	// Add to databases on server.
-	s.databases[c.Name] = db
-
-	return
-}
-
 // DropDatabase deletes an existing database.
 func (s *Server) DropDatabase(name string) error {
 	if name == "" {
 		return ErrDatabaseNameRequired
 	}
-	c := &dropDatabaseCommand{Name: name}
-	_, err := s.broadcast(dropDatabaseMessageType, c)
-	return err
-}
 
-func (s *Server) applyDropDatabase(m *messaging.Message) (err error) {
-	var c dropDatabaseCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	if s.databases[c.Name] == nil {
-		return ErrDatabaseNotFound(c.Name)
-	}
-
-	// Remove from metastore.
-	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error { return tx.dropDatabase(c.Name) })
-
-	db := s.databases[c.Name]
-	for _, rp := range db.policies {
-		for _, sg := range rp.shardGroups {
-			for _, sh := range sg.Shards {
-
-				// if we have this shard locally, close and remove it
-				if sh.store != nil {
-					// close topic readers/heartbeaters/etc. connections
-					err := s.client.CloseConn(sh.ID)
-					if err != nil {
-						panic(err)
-					}
-
-					err = sh.close()
-					if err != nil {
-						panic(err)
-					}
-
-					err = os.Remove(s.shardPath(sh.ID))
-					if err != nil {
-						panic(err)
-					}
-				}
-
-				delete(s.shards, sh.ID)
-			}
-		}
-	}
-
-	// Delete the database entry.
-	delete(s.databases, c.Name)
-
-	return
+	return s.MetaStore.DropDatabase(name)
 }
 
 // Shard returns a shard by ID.
@@ -1201,133 +1020,13 @@ func (s *Server) ShardGroups(database string) ([]*ShardGroup, error) {
 
 // CreateShardGroupIfNotExists creates the shard group for a retention policy for the interval a timestamp falls into.
 func (s *Server) CreateShardGroupIfNotExists(database, policy string, timestamp time.Time) error {
-	c := &createShardGroupIfNotExistsCommand{Database: database, Policy: policy, Timestamp: timestamp}
-	_, err := s.broadcast(createShardGroupIfNotExistsMessageType, c)
+	_, err := s.MetaStore.CreateShardGroupIfNotExists(database, policy, timestamp)
 	return err
-}
-
-func (s *Server) applyCreateShardGroupIfNotExists(m *messaging.Message) error {
-	var c createShardGroupIfNotExistsCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Retrieve database.
-	db := s.databases[c.Database]
-	if s.databases[c.Database] == nil {
-		return ErrDatabaseNotFound(c.Database)
-	}
-
-	// Validate retention policy.
-	rp := db.policies[c.Policy]
-	if rp == nil {
-		return ErrRetentionPolicyNotFound
-	}
-
-	// If we can match to an existing shard group date range then just ignore request.
-	if g := rp.shardGroupByTimestamp(c.Timestamp); g != nil {
-		return nil
-	}
-
-	// Sort nodes so they're consistently assigned to the shards.
-	nodes := make([]*DataNode, 0, len(s.dataNodes))
-	for _, n := range s.dataNodes {
-		nodes = append(nodes, n)
-	}
-	sort.Sort(dataNodes(nodes))
-
-	// Require at least one replica but no more replicas than nodes.
-	replicaN := int(rp.ReplicaN)
-	if replicaN == 0 {
-		replicaN = 1
-	} else if replicaN > len(nodes) {
-		replicaN = len(nodes)
-	}
-
-	// Determine shard count by node count divided by replication factor.
-	// This will ensure nodes will get distributed across nodes evenly and
-	// replicated the correct number of times.
-	shardN := len(nodes) / replicaN
-
-	g := newShardGroup(c.Timestamp, rp.ShardGroupDuration)
-
-	// Create and intialize shards based on the node count and replication factor.
-	if err := g.initialize(m.Index, shardN, replicaN, db, rp, nodes, s.meta); err != nil {
-		g.close(s.id)
-		return err
-	}
-	s.stats.Add("shardsCreated", int64(shardN))
-
-	// Open shards assigned to this server.
-	for _, sh := range g.Shards {
-		// Ignore if this server is not assigned.
-		if !sh.HasDataNodeID(s.id) {
-			continue
-		}
-
-		// Open shard store. Panic if an error occurs and we can retry.
-		if err := sh.open(s.shardPath(sh.ID), s.client.Conn(sh.ID)); err != nil {
-			panic("unable to open shard: " + err.Error())
-		}
-	}
-
-	// Add to lookups.
-	for _, sh := range g.Shards {
-		s.shards[sh.ID] = sh
-	}
-
-	return nil
 }
 
 // DeleteShardGroup deletes the shard group identified by shardID.
 func (s *Server) DeleteShardGroup(database, policy string, shardID uint64) error {
-	c := &deleteShardGroupCommand{Database: database, Policy: policy, ID: shardID}
-	_, err := s.broadcast(deleteShardGroupMessageType, c)
-	return err
-}
-
-// applyDeleteShardGroup deletes shard data from disk and updates the metastore.
-func (s *Server) applyDeleteShardGroup(m *messaging.Message) (err error) {
-	var c deleteShardGroupCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Retrieve database.
-	db := s.databases[c.Database]
-	if s.databases[c.Database] == nil {
-		return ErrDatabaseNotFound(c.Database)
-	}
-
-	// Validate retention policy.
-	rp := db.policies[c.Policy]
-	if rp == nil {
-		return ErrRetentionPolicyNotFound
-	}
-
-	// If shard group no longer exists, then ignore request. This can occur if multiple
-	// data nodes triggered the deletion.
-	g := rp.shardGroupByID(c.ID)
-	if g == nil {
-		return nil
-	}
-
-	// close the shard group
-	if err := g.close(s.id); err != nil {
-		// Log, but keep going. This can happen if shards were deleted, but the server exited
-		// before it acknowledged the delete command.
-		log.Printf("error deleting shard: policy %s, group ID %d, %s", rp.Name, g.ID, err)
-	}
-
-	// Remove from metastore.
-	rp.removeShardGroupByID(c.ID)
-	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		s.stats.Add("shardsDeleted", int64(len(g.Shards)))
-		return tx.saveDatabase(db)
-	})
-
-	// remove from lookups.
-	for _, sh := range g.Shards {
-		delete(s.shards, sh.ID)
-	}
-
-	return
+	return s.MetaStore.DeleteShardGroup(database, policy, shardID)
 }
 
 // User returns a user by username
@@ -1392,140 +1091,23 @@ func (s *Server) Authenticate(username, password string) (*User, error) {
 
 // CreateUser creates a user on the server.
 func (s *Server) CreateUser(username, password string, admin bool) error {
-	c := &createUserCommand{Username: username, Password: password, Admin: admin}
-	_, err := s.broadcast(createUserMessageType, c)
-	return err
-}
-
-func (s *Server) applyCreateUser(m *messaging.Message) (err error) {
-	var c createUserCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Validate user.
-	if c.Username == "" {
-		return ErrUsernameRequired
-	} else if s.users[c.Username] != nil {
-		return ErrUserExists
-	}
-
-	// Generate the hash of the password.
-	hash, err := HashPassword(c.Password)
-	if err != nil {
-		return err
-	}
-
-	// Create the user.
-	u := &User{
-		Name:       c.Username,
-		Hash:       string(hash),
-		Privileges: make(map[string]influxql.Privilege),
-		Admin:      c.Admin,
-	}
-
-	// Persist to metastore.
-	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.saveUser(u)
-	})
-
-	s.users[u.Name] = u
-	return
+	return s.CreateUser(username, password, admin)
 }
 
 // UpdateUser updates an existing user on the server.
 func (s *Server) UpdateUser(username, password string) error {
-	c := &updateUserCommand{Username: username, Password: password}
-	_, err := s.broadcast(updateUserMessageType, c)
+	_, err := s.MetaStore.UpdateUser(username, password)
 	return err
-}
-
-func (s *Server) applyUpdateUser(m *messaging.Message) (err error) {
-	var c updateUserCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Validate command.
-	u := s.users[c.Username]
-	if u == nil {
-		return ErrUserNotFound
-	}
-
-	// Update the user's password, if set.
-	if c.Password != "" {
-		hash, err := HashPassword(c.Password)
-		if err != nil {
-			return err
-		}
-		u.Hash = string(hash)
-	}
-
-	// Persist to metastore.
-	return s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.saveUser(u)
-	})
 }
 
 // DeleteUser removes a user from the server.
 func (s *Server) DeleteUser(username string) error {
-	c := &deleteUserCommand{Username: username}
-	_, err := s.broadcast(deleteUserMessageType, c)
-	return err
-}
-
-func (s *Server) applyDeleteUser(m *messaging.Message) error {
-	var c deleteUserCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Validate user.
-	if c.Username == "" {
-		return ErrUsernameRequired
-	} else if s.users[c.Username] == nil {
-		return ErrUserNotFound
-	}
-
-	// Remove from metastore.
-	s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.deleteUser(c.Username)
-	})
-
-	// Delete the user.
-	delete(s.users, c.Username)
-	return nil
+	return s.MetaStore.DeleteUser(username)
 }
 
 // SetPrivilege grants / revokes a privilege to a user.
 func (s *Server) SetPrivilege(p influxql.Privilege, username string, dbname string) error {
-	c := &setPrivilegeCommand{p, username, dbname}
-	_, err := s.broadcast(setPrivilegeMessageType, c)
-	return err
-}
-
-func (s *Server) applySetPrivilege(m *messaging.Message) error {
-	var c setPrivilegeCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Validate user.
-	if c.Username == "" {
-		return ErrUsernameRequired
-	}
-
-	u := s.users[c.Username]
-	if u == nil {
-		return ErrUserNotFound
-	}
-
-	// If dbname is empty, update user's Admin flag.
-	if c.Database == "" && (c.Privilege == influxql.AllPrivileges || c.Privilege == influxql.NoPrivileges) {
-		u.Admin = (c.Privilege == influxql.AllPrivileges)
-	} else if c.Database != "" {
-		// Update user's privilege for the database.
-		u.Privileges[c.Database] = c.Privilege
-	} else {
-		return ErrInvalidGrantRevoke
-	}
-
-	// Persist to metastore.
-	return s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.saveUser(u)
-	})
+	return s.MetaStore.SetPrivilege(p, username, dbname)
 }
 
 // RetentionPolicy returns a retention policy by name.
@@ -1593,15 +1175,7 @@ func (s *Server) CreateRetentionPolicy(database string, rp *RetentionPolicy) err
 		return ErrRetentionPolicyMinDuration
 	}
 
-	c := &createRetentionPolicyCommand{
-		Database:           database,
-		Name:               rp.Name,
-		Duration:           rp.Duration,
-		ShardGroupDuration: calculateShardGroupDuration(rp.Duration),
-		ReplicaN:           rp.ReplicaN,
-	}
-	_, err := s.broadcast(createRetentionPolicyMessageType, c)
-	return err
+	return s.CreateRetentionPolicy(database, rp)
 }
 
 // CreateRetentionPolicyIfNotExists creates a retention policy for a database.
@@ -1632,36 +1206,6 @@ func calculateShardGroupDuration(d time.Duration) time.Duration {
 	}
 }
 
-func (s *Server) applyCreateRetentionPolicy(m *messaging.Message) error {
-	var c createRetentionPolicyCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Retrieve the database.
-	db := s.databases[c.Database]
-	if s.databases[c.Database] == nil {
-		return ErrDatabaseNotFound(c.Database)
-	} else if c.Name == "" {
-		return ErrRetentionPolicyNameRequired
-	} else if db.policies[c.Name] != nil {
-		return ErrRetentionPolicyExists
-	}
-
-	// Add policy to the database.
-	db.policies[c.Name] = &RetentionPolicy{
-		Name:               c.Name,
-		Duration:           c.Duration,
-		ShardGroupDuration: c.ShardGroupDuration,
-		ReplicaN:           c.ReplicaN,
-	}
-
-	// Persist to metastore.
-	s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.saveDatabase(db)
-	})
-
-	return nil
-}
-
 // RetentionPolicyUpdate represents retention policy fields that
 // need to be updated.
 type RetentionPolicyUpdate struct {
@@ -1671,155 +1215,29 @@ type RetentionPolicyUpdate struct {
 }
 
 // UpdateRetentionPolicy updates an existing retention policy on a database.
-func (s *Server) UpdateRetentionPolicy(database, name string, rpu *RetentionPolicyUpdate) error {
+func (s *Server) UpdateRetentionPolicy(database, name string, rpu *meta.RetentionPolicyUpdate) error {
 	// Enforce duration of at least retentionPolicyMinDuration
 	if rpu.Duration != nil && *rpu.Duration < retentionPolicyMinDuration && *rpu.Duration != 0 {
 		return ErrRetentionPolicyMinDuration
 	}
 
-	c := &updateRetentionPolicyCommand{Database: database, Name: name, Policy: rpu}
-	_, err := s.broadcast(updateRetentionPolicyMessageType, c)
+	_, err := s.MetaStore.UpdateRetentionPolicy(database, name, rpu)
 	return err
-}
-
-func (s *Server) applyUpdateRetentionPolicy(m *messaging.Message) (err error) {
-	var c updateRetentionPolicyCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Validate command.
-	db := s.databases[c.Database]
-	if s.databases[c.Database] == nil {
-		return ErrDatabaseNotFound(c.Database)
-	} else if c.Name == "" {
-		return ErrRetentionPolicyNameRequired
-	}
-
-	// Retrieve the policy.
-	p := db.policies[c.Name]
-	if db.policies[c.Name] == nil {
-		return ErrRetentionPolicyNotFound
-	}
-
-	// Update the policy name.
-	if c.Policy.Name != nil {
-		delete(db.policies, p.Name)
-		p.Name = *c.Policy.Name
-		db.policies[p.Name] = p
-	}
-
-	// Update duration.
-	if c.Policy.Duration != nil {
-		p.Duration = *c.Policy.Duration
-	}
-
-	// Update replication factor.
-	if c.Policy.ReplicaN != nil {
-		p.ReplicaN = *c.Policy.ReplicaN
-	}
-
-	// Persist to metastore.
-	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.saveDatabase(db)
-	})
-
-	return
 }
 
 // DeleteRetentionPolicy removes a retention policy from a database.
 func (s *Server) DeleteRetentionPolicy(database, name string) error {
-	c := &deleteRetentionPolicyCommand{Database: database, Name: name}
-	_, err := s.broadcast(deleteRetentionPolicyMessageType, c)
-	return err
-}
-
-func (s *Server) applyDeleteRetentionPolicy(m *messaging.Message) (err error) {
-	var c deleteRetentionPolicyCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Retrieve the database.
-	db := s.databases[c.Database]
-	if s.databases[c.Database] == nil {
-		return ErrDatabaseNotFound(c.Database)
-	} else if c.Name == "" {
-		return ErrRetentionPolicyNameRequired
-	} else if db.policies[c.Name] == nil {
-		return ErrRetentionPolicyNotFound
-	}
-
-	// Remove retention policy.
-	delete(db.policies, c.Name)
-
-	// Persist to metastore.
-	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.saveDatabase(db)
-	})
-
-	return
+	return s.MetaStore.DeleteRetentionPolicy(database, name)
 }
 
 // SetDefaultRetentionPolicy sets the default policy to write data into and query from on a database.
 func (s *Server) SetDefaultRetentionPolicy(database, name string) error {
-	c := &setDefaultRetentionPolicyCommand{Database: database, Name: name}
-	_, err := s.broadcast(setDefaultRetentionPolicyMessageType, c)
-	return err
-}
-
-func (s *Server) applySetDefaultRetentionPolicy(m *messaging.Message) (err error) {
-	var c setDefaultRetentionPolicyCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Validate command.
-	db := s.databases[c.Database]
-	if s.databases[c.Database] == nil {
-		return ErrDatabaseNotFound(c.Database)
-	} else if db.policies[c.Name] == nil {
-		return ErrRetentionPolicyNotFound
-	}
-
-	// Update default policy.
-	db.defaultRetentionPolicy = c.Name
-
-	// Persist to metastore.
-	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.saveDatabase(db)
-	})
-
-	return
-}
-
-func (s *Server) applyDropSeries(m *messaging.Message) error {
-	var c dropSeriesCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	database := s.databases[c.Database]
-	if database == nil {
-		return ErrDatabaseNotFound(c.Database)
-	}
-
-	// Remove from metastore.
-	err := s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		if err := tx.dropSeries(c.Database, c.SeriesByMeasurement); err != nil {
-			return err
-		}
-
-		// Delete series from the database.
-		if err := database.dropSeries(c.SeriesByMeasurement); err != nil {
-			return fmt.Errorf("failed to remove series from index: %s", err)
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return s.MetaStore.SetDefaultRetentionPolicy(database, name)
 }
 
 // DropSeries deletes from an existing series.
 func (s *Server) DropSeries(database string, seriesByMeasurement map[string][]uint64) error {
-	c := dropSeriesCommand{Database: database, SeriesByMeasurement: seriesByMeasurement}
-	_, err := s.broadcast(dropSeriesMessageType, c)
-	return err
+	return s.DropSeries(database, seriesByMeasurement)
 }
 
 // Point defines the values that will be written to the database
@@ -1870,18 +1288,10 @@ func (s *Server) WriteSeries(database, retentionPolicy string, points []Point) (
 		retentionPolicy = rp.Name
 	}
 
-	// Ensure all required Series and Measurement Fields are created cluster-wide.
-	if err := s.createMeasurementsIfNotExists(database, retentionPolicy, points); err != nil {
-		return 0, err
-	}
 	if s.WriteTrace {
 		log.Printf("measurements and series created on database '%s'", database)
 	}
 
-	// Ensure all the required shard groups exist. TODO: this should be done async.
-	if err := s.createShardGroupsIfNotExists(database, retentionPolicy, points); err != nil {
-		return 0, err
-	}
 	if s.WriteTrace {
 		log.Printf("shard groups created for database '%s'", database)
 	}
@@ -1950,226 +1360,30 @@ func (s *Server) WriteSeries(database, retentionPolicy string, points []Point) (
 	}(); err != nil {
 		return 0, err
 	}
+	/*
+		// Write data for each shard to the Broker.
+		var maxIndex uint64
+		for i, d := range shardData {
+			assert(len(d) > 0, "raw series data required: topic=%d", i)
 
-	// Write data for each shard to the Broker.
-	var maxIndex uint64
-	for i, d := range shardData {
-		assert(len(d) > 0, "raw series data required: topic=%d", i)
-
-		index, err := s.client.Publish(&messaging.Message{
-			Type:    writeRawSeriesMessageType,
-			TopicID: i,
-			Data:    d,
-		})
-		if err != nil {
-			return maxIndex, err
-		}
-		s.stats.Inc("writeSeriesMessageTx")
-		if index > maxIndex {
-			maxIndex = index
-		}
-		if s.WriteTrace {
-			log.Printf("write series message published successfully for topic %d", i)
-		}
-	}
-
-	return maxIndex, nil
-}
-
-// createMeasurementsIfNotExists walks the "points" and ensures that all new Series are created, and all
-// new Measurement fields have been created, across the cluster.
-func (s *Server) createMeasurementsIfNotExists(database, retentionPolicy string, points []Point) error {
-	c := newCreateMeasurementsIfNotExistsCommand(database)
-
-	// Local function keeps lock management foolproof.
-	func() error {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-
-		db := s.databases[database]
-		if db == nil {
-			return ErrDatabaseNotFound(database)
-		}
-
-		for _, p := range points {
-			measurement, series := db.MeasurementAndSeries(p.Name, p.Tags)
-
-			if series == nil {
-				// Series does not exist in Metastore, add it so it's created cluster-wide.
-				c.addSeriesIfNotExists(p.Name, p.Tags)
-			}
-
-			for k, v := range p.Fields {
-				if measurement != nil {
-					if f := measurement.FieldByName(k); f != nil {
-						// Field present in Metastore, make sure there is no type conflict.
-						if f.Type != influxql.InspectDataType(v) {
-							return fmt.Errorf("field \"%s\" is type %T, mapped as type %s", k, v, f.Type)
-						}
-						continue // Field is present, and it's of the same type. Nothing more to do.
-					}
-				}
-				// Field isn't in Metastore. Add it to command so it's created cluster-wide.
-				if err := c.addFieldIfNotExists(p.Name, k, influxql.InspectDataType(v)); err != nil {
-					return err
-				}
-			}
-		}
-
-		return nil
-	}()
-
-	// Any broadcast actually required?
-	if len(c.Measurements) > 0 {
-		_, err := s.broadcast(createMeasurementsIfNotExistsMessageType, c)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// applyCreateMeasurementsIfNotExists creates the Measurements, Series, and Fields in the Metastore.
-func (s *Server) applyCreateMeasurementsIfNotExists(m *messaging.Message) error {
-	var c createMeasurementsIfNotExistsCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	// Validate command.
-	db := s.databases[c.Database]
-	if db == nil {
-		return ErrDatabaseNotFound(c.Database)
-	}
-
-	// Process command within a transaction.
-	if err := s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		for _, cm := range c.Measurements {
-			// Create each series
-			for _, t := range cm.Tags {
-				_, ss := db.MeasurementAndSeries(cm.Name, t)
-
-				// Ensure creation of Series is idempotent.
-				if ss != nil {
-					continue
-				}
-
-				series, err := tx.createSeries(db.name, cm.Name, t)
-				if err != nil {
-					return err
-				}
-				db.addSeriesToIndex(cm.Name, series)
-			}
-
-			// Create each new field.
-			mm := db.measurements[cm.Name]
-			if mm == nil {
-				panic(fmt.Sprintf("measurement not found: %s", cm.Name))
-			}
-			for _, f := range cm.Fields {
-				if err := mm.createFieldIfNotExists(f.Name, f.Type); err != nil {
-					if err == ErrFieldOverflow {
-						log.Printf("no more fields allowed: %s::%s", mm.Name, f.Name)
-						continue
-					} else if err == ErrFieldTypeConflict {
-						log.Printf("field type conflict: %s::%s", mm.Name, f.Name)
-						continue
-					}
-					return err
-				}
-				if err := tx.saveMeasurement(db.name, mm); err != nil {
-					return fmt.Errorf("save measurement: %s", err)
-				}
-			}
-			if err := tx.saveDatabase(db); err != nil {
-				return fmt.Errorf("save database: %s", err)
-			}
-		}
-
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// DropMeasurement drops a given measurement from a database.
-func (s *Server) DropMeasurement(database, name string) error {
-	c := &dropMeasurementCommand{Database: database, Name: name}
-	_, err := s.broadcast(dropMeasurementMessageType, c)
-	return err
-}
-
-func (s *Server) applyDropMeasurement(m *messaging.Message) error {
-	var c dropMeasurementCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	database := s.databases[c.Database]
-	if database == nil {
-		return ErrDatabaseNotFound(c.Database)
-	}
-
-	measurement := database.measurements[c.Name]
-	if measurement == nil {
-		return ErrMeasurementNotFound(c.Name)
-	}
-
-	err := s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		// Drop metastore data
-		if err := tx.dropMeasurement(c.Database, c.Name); err != nil {
-			return err
-		}
-
-		// Drop measurement from the database.
-		if err := database.dropMeasurement(c.Name); err != nil {
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// createShardGroupsIfNotExist walks the "points" and ensures that all required shards exist on the cluster.
-func (s *Server) createShardGroupsIfNotExists(database, retentionPolicy string, points []Point) error {
-	var commands = make([]*createShardGroupIfNotExistsCommand, 0)
-
-	err := func() error {
-		// Local function makes locking fool-proof.
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		for _, p := range points {
-			// Check if shard group exists first.
-			g, err := s.shardGroupByTimestamp(database, retentionPolicy, p.Timestamp)
-			if err != nil {
-				return err
-			} else if g != nil {
-				continue
-			}
-			commands = append(commands, &createShardGroupIfNotExistsCommand{
-				Database:  database,
-				Policy:    retentionPolicy,
-				Timestamp: p.Timestamp,
+			index, err := s.client.Publish(&messaging.Message{
+				Type:    writeRawSeriesMessageType,
+				TopicID: i,
+				Data:    d,
 			})
+			if err != nil {
+				return maxIndex, err
+			}
+			s.stats.Inc("writeSeriesMessageTx")
+			if index > maxIndex {
+				maxIndex = index
+			}
+			if s.WriteTrace {
+				log.Printf("write series message published successfully for topic %d", i)
+			}
 		}
-		return nil
-	}()
-	if err != nil {
-		return err
-	}
-
-	// Create any required shard groups across the cluster. Must be done without holding the lock.
-	for _, c := range commands {
-		err = s.CreateShardGroupIfNotExists(c.Database, c.Policy, c.Timestamp)
-		if err != nil {
-			return fmt.Errorf("create shard(%s:%s/%s): %s", c.Database, c.Policy, c.Timestamp.Format(time.RFC3339Nano), err)
-		}
-	}
-
-	return nil
+	*/
+	return 0, nil
 }
 
 // ReadSeries reads a single point from a series in the database. It is used for debug and test only.
@@ -2596,7 +1810,18 @@ func (s *Server) executeDropUserStatement(q *influxql.DropUserStatement, user *U
 }
 
 func (s *Server) executeDropMeasurementStatement(stmt *influxql.DropMeasurementStatement, database string, user *User) *Result {
-	return &Result{Err: s.DropMeasurement(database, stmt.Name)}
+	res := s.QueryExecutor.Execute(&QueryRequest{
+		Statement: stmt,
+		Database:  database,
+		User:      user,
+	})
+
+	for r := range res {
+		if r.Err != nil {
+			return r
+		}
+	}
+	return &Result{Err: nil}
 }
 
 func (s *Server) executeDropSeriesStatement(stmt *influxql.DropSeriesStatement, database string, user *User) *Result {
@@ -3143,7 +2368,7 @@ func (s *Server) executeCreateRetentionPolicyStatement(stmt *influxql.CreateRete
 }
 
 func (s *Server) executeAlterRetentionPolicyStatement(stmt *influxql.AlterRetentionPolicyStatement, user *User) *Result {
-	rpu := &RetentionPolicyUpdate{
+	rpu := &meta.RetentionPolicyUpdate{
 		Duration: stmt.Duration,
 		ReplicaN: func() *uint32 {
 			if stmt.Replication == nil {
@@ -3194,14 +2419,17 @@ func (s *Server) executeShowRetentionPoliciesStatement(q *influxql.ShowRetention
 	return &Result{Series: []*influxql.Row{row}}
 }
 
+func (s *Server) ClusterID() uint64 {
+	return s.MetaStore.ClusterID()
+}
+
 func (s *Server) executeCreateContinuousQueryStatement(q *influxql.CreateContinuousQueryStatement, user *User) *Result {
 	return &Result{Err: s.CreateContinuousQuery(q)}
 }
 
 // CreateContinuousQuery creates a continuous query.
 func (s *Server) CreateContinuousQuery(q *influxql.CreateContinuousQueryStatement) error {
-	c := &createContinuousQueryCommand{Query: q.String()}
-	_, err := s.broadcast(createContinuousQueryMessageType, c)
+	_, err := s.MetaStore.CreateContinuousQuery(q)
 	return err
 }
 
@@ -3211,9 +2439,7 @@ func (s *Server) executeDropContinuousQueryStatement(q *influxql.DropContinuousQ
 
 // DropContinuousQuery dropsoa continuous query.
 func (s *Server) DropContinuousQuery(q *influxql.DropContinuousQueryStatement) error {
-	c := &dropContinuousQueryCommand{Name: q.Name, Database: q.Database}
-	_, err := s.broadcast(dropContinuousQueryMessageType, c)
-	return err
+	return s.MetaStore.DropContinuousQuery(q)
 }
 
 // ContinuousQueries returns a list of all continuous queries.
@@ -3472,88 +2698,6 @@ func (s *Server) DiagnosticsAsRows() []*influxql.Row {
 	}
 }
 
-// processor runs in a separate goroutine and processes all incoming broker messages.
-func (s *Server) processor(conn MessagingConn, done chan struct{}) {
-	for {
-		// Read incoming message.
-		var m *messaging.Message
-		var ok bool
-		select {
-		case <-done:
-			return
-		case m, ok = <-conn.C():
-			if !ok {
-				return
-			}
-		}
-
-		// All messages must be processed under lock.
-		func() {
-			s.stats.Inc("broadcastMessageRx")
-			s.mu.Lock()
-			defer s.mu.Unlock()
-
-			// Exit if closed or if the index is below the high water mark.
-			if !s.opened() {
-				return
-			} else if s.index >= m.Index {
-				return
-			}
-
-			// Process message.
-			var err error
-			switch m.Type {
-			case createDataNodeMessageType:
-				err = s.applyCreateDataNode(m)
-			case deleteDataNodeMessageType:
-				err = s.applyDeleteDataNode(m)
-			case createDatabaseMessageType:
-				err = s.applyCreateDatabase(m)
-			case dropDatabaseMessageType:
-				err = s.applyDropDatabase(m)
-			case createUserMessageType:
-				err = s.applyCreateUser(m)
-			case updateUserMessageType:
-				err = s.applyUpdateUser(m)
-			case deleteUserMessageType:
-				err = s.applyDeleteUser(m)
-			case createRetentionPolicyMessageType:
-				err = s.applyCreateRetentionPolicy(m)
-			case updateRetentionPolicyMessageType:
-				err = s.applyUpdateRetentionPolicy(m)
-			case deleteRetentionPolicyMessageType:
-				err = s.applyDeleteRetentionPolicy(m)
-			case createShardGroupIfNotExistsMessageType:
-				err = s.applyCreateShardGroupIfNotExists(m)
-			case deleteShardGroupMessageType:
-				err = s.applyDeleteShardGroup(m)
-			case setDefaultRetentionPolicyMessageType:
-				err = s.applySetDefaultRetentionPolicy(m)
-			case createMeasurementsIfNotExistsMessageType:
-				err = s.applyCreateMeasurementsIfNotExists(m)
-			case dropMeasurementMessageType:
-				err = s.applyDropMeasurement(m)
-			case setPrivilegeMessageType:
-				err = s.applySetPrivilege(m)
-			case createContinuousQueryMessageType:
-				err = s.applyCreateContinuousQueryCommand(m)
-			case dropContinuousQueryMessageType:
-				err = s.applyDropContinuousQueryCommand(m)
-			case dropSeriesMessageType:
-				err = s.applyDropSeries(m)
-			case writeRawSeriesMessageType:
-				panic("write series not allowed in broadcast topic")
-			}
-
-			// Sync high water mark and errors.
-			s.index = m.Index
-			if err != nil {
-				s.errors[m.Index] = err
-			}
-		}()
-	}
-}
-
 // Result represents a resultset returned from a single statement.
 type Result struct {
 	// StatementID is just the statement's position in the query. It's used
@@ -3651,40 +2795,6 @@ func (r *Response) Error() error {
 		}
 	}
 	return nil
-}
-
-// MessagingClient represents the client used to connect to brokers.
-type MessagingClient interface {
-	Open(path string) error
-	Close() error
-
-	// Retrieves or sets the current list of broker URLs.
-	URLs() []url.URL
-	SetURLs([]url.URL)
-
-	// Publishes a message to the broker.
-	Publish(m *messaging.Message) (index uint64, err error)
-
-	// Conn returns an open, streaming connection to a topic.
-	Conn(topicID uint64) MessagingConn
-	CloseConn(topicID uint64) error
-}
-
-type messagingClient struct {
-	*messaging.Client
-}
-
-// NewMessagingClient returns an instance of MessagingClient.
-func NewMessagingClient(dataURL url.URL) MessagingClient {
-	return &messagingClient{messaging.NewClient(dataURL)}
-}
-
-func (c *messagingClient) Conn(topicID uint64) MessagingConn { return c.Client.Conn(topicID) }
-
-// MessagingConn represents a streaming connection to a single broker topic.
-type MessagingConn interface {
-	Open(index uint64, streaming bool) error
-	C() <-chan *messaging.Message
 }
 
 // DataNode represents a data node in the cluster.
@@ -3885,83 +2995,6 @@ func NewContinuousQuery(q string) (*ContinuousQuery, error) {
 	}
 
 	return cquery, nil
-}
-
-// applyCreateContinuousQueryCommand adds the continuous query to the database object and saves it to the metastore
-func (s *Server) applyCreateContinuousQueryCommand(m *messaging.Message) error {
-	var c createContinuousQueryCommand
-	mustUnmarshalJSON(m.Data, &c)
-
-	cq, err := NewContinuousQuery(c.Query)
-	if err != nil {
-		return err
-	}
-
-	// normalize the select statement in the CQ so that it has the database and retention policy inserted
-	if err := s.normalizeStatement(cq.cq.Source, cq.cq.Database); err != nil {
-		return err
-	}
-
-	// ensure the into database exists
-	if s.databases[cq.intoDB()] == nil {
-		return ErrDatabaseNotFound(cq.intoDB())
-	}
-
-	// Retrieve the database.
-	db := s.databases[cq.cq.Database]
-	if db == nil {
-		return ErrDatabaseNotFound(cq.cq.Database)
-	} else if db.continuousQueryByName(cq.cq.Name) != nil {
-		return ErrContinuousQueryExists
-	}
-
-	// Add cq to the database.
-	db.continuousQueries = append(db.continuousQueries, cq)
-
-	// Persist to metastore.
-	s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.saveDatabase(db)
-	})
-
-	return nil
-}
-
-// applyDropContinuousQueryCommand removes the continuous query from the database object and saves it to the metastore
-func (s *Server) applyDropContinuousQueryCommand(m *messaging.Message) error {
-	var c dropContinuousQueryCommand
-
-	mustUnmarshalJSON(m.Data, &c)
-
-	// retrieve the database and ensure that it exists
-	db := s.databases[c.Database]
-	if db == nil {
-		return ErrDatabaseNotFound(c.Database)
-	}
-
-	// loop through continuous queries and find the match
-	cqIndex := -1
-	for n, continuousQuery := range db.continuousQueries {
-		if continuousQuery.cq.Name == c.Name {
-			cqIndex = n
-			break
-		}
-	}
-
-	if cqIndex == -1 {
-		return ErrContinuousQueryNotFound
-	}
-
-	// delete the relevant continuous query
-	copy(db.continuousQueries[cqIndex:], db.continuousQueries[cqIndex+1:])
-	db.continuousQueries[len(db.continuousQueries)-1] = nil
-	db.continuousQueries = db.continuousQueries[:len(db.continuousQueries)-1]
-
-	// persist to metastore
-	s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		return tx.saveDatabase(db)
-	})
-
-	return nil
 }
 
 // RunContinuousQueries will run any continuous queries that are due to run and write the

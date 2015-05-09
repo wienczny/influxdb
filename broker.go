@@ -1,16 +1,6 @@
 package influxdb
 
-import (
-	"fmt"
-	"log"
-	"math/rand"
-	"net/http"
-	"net/url"
-	"sync"
-	"time"
-
-	"github.com/influxdb/influxdb/messaging"
-)
+import "time"
 
 const (
 	// DefaultContinuousQueryCheckTime is how frequently the broker will ask a data node
@@ -26,10 +16,10 @@ const (
 	DefaultFailureSleep = 100 * time.Millisecond
 )
 
+/*
 // Broker represents an InfluxDB specific messaging broker.
 type Broker struct {
-	mu sync.RWMutex
-	*messaging.Broker
+	mu     sync.RWMutex
 	client *http.Client
 
 	done chan struct{}
@@ -43,7 +33,6 @@ type Broker struct {
 // NewBroker returns a new instance of a Broker with default values.
 func NewBroker() *Broker {
 	return &Broker{
-		Broker: messaging.NewBroker(),
 		client: &http.Client{
 			Timeout: DefaultDataNodeTimeout,
 		},
@@ -77,13 +66,17 @@ func (b *Broker) Close() error {
 	// it will use the DefaultTransport.
 	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
 
-	return b.Broker.Close()
+	return nil
+}
+
+func (b *Broker) IsLeader() bool {
+	return false
 }
 
 func (b *Broker) continuousQueryLoop(done chan struct{}) {
 	for {
 		// Check if broker is currently leader.
-		if b.Broker.IsLeader() {
+		if b.IsLeader() {
 			b.runContinuousQueries()
 		}
 
@@ -144,3 +137,4 @@ func (b *Broker) requestContinuousQueryProcessing(cqURL url.URL) error {
 
 	return nil
 }
+*/

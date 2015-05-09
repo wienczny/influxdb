@@ -8,6 +8,9 @@ import (
 
 // Store represents an interface access and mutate metadata.
 type Store interface {
+	ClusterID() uint64
+	IsLeader() bool
+
 	CreateContinuousQuery(q *influxql.CreateContinuousQueryStatement) (*ContinuousQueryInfo, error)
 	DropContinuousQuery(q *influxql.DropContinuousQueryStatement) error
 

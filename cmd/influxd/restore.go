@@ -5,17 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
-	"math/rand"
-	"net/url"
 	"os"
 	"path/filepath"
-	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/raft"
 )
 
 // RestoreCommand represents the program execution for "influxd restore".
@@ -67,19 +61,14 @@ func (cmd *RestoreCommand) Restore(config *Config, path string) error {
 	defer closeAll(files)
 
 	// Extract manifest.
-	ss, err := ssr.Snapshot()
-	if err != nil {
-		return fmt.Errorf("snapshot: %s", err)
-	}
+	//ss, err := ssr.Snapshot()
+	//if err != nil {
+	//return fmt.Errorf("snapshot: %s", err)
+	//}
 
 	// Unpack snapshot files into data directory.
 	if err := cmd.unpack(config.DataDir(), ssr); err != nil {
 		return fmt.Errorf("unpack: %s", err)
-	}
-
-	// Generate broker & raft directories from manifest.
-	if err := cmd.materialize(config.BrokerDir(), ss, config.ClusterURL()); err != nil {
-		return fmt.Errorf("materialize: %s", err)
 	}
 
 	// Notify user of completion.
@@ -167,87 +156,6 @@ func (cmd *RestoreCommand) unpack(path string, ssr *influxdb.SnapshotsReader) er
 		}(); err != nil {
 			return err
 		}
-	}
-
-	return nil
-}
-
-// materialize creates broker & raft directories based on the snapshot.
-func (cmd *RestoreCommand) materialize(path string, ss *influxdb.Snapshot, u url.URL) error {
-	// Materialize broker.
-	if err := cmd.materializeBroker(path, ss.Index()); err != nil {
-		return fmt.Errorf("broker: %s", err)
-	}
-
-	// Materialize raft.
-	if err := cmd.materializeRaft(filepath.Join(path, "raft"), u); err != nil {
-		return fmt.Errorf("raft: %s", err)
-	}
-
-	return nil
-}
-
-func (cmd *RestoreCommand) materializeBroker(path string, index uint64) error {
-	// Create root directory.
-	if err := os.MkdirAll(path, 0777); err != nil {
-		return fmt.Errorf("mkdir: err=%s", err)
-	}
-
-	// Create broker meta store.
-	meta, err := bolt.Open(filepath.Join(path, "meta"), 0666, &bolt.Options{Timeout: 1 * time.Second})
-	if err != nil {
-		return fmt.Errorf("open broker meta: %s", err)
-	}
-	defer meta.Close()
-
-	// Write highest index to meta store.
-	if err := meta.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucket([]byte("meta"))
-		if err != nil {
-			return fmt.Errorf("create meta bucket: %s", err)
-		}
-
-		if err := b.Put([]byte("index"), u64tob(index)); err != nil {
-			return fmt.Errorf("put: %s", err)
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("update broker meta: %s", err)
-	}
-
-	return nil
-}
-
-func (cmd *RestoreCommand) materializeRaft(path string, u url.URL) error {
-	// Create raft directory.
-	if err := os.MkdirAll(path, 0777); err != nil {
-		return fmt.Errorf("mkdir raft: err=%s", err)
-	}
-
-	// Write raft id & term.
-	if err := ioutil.WriteFile(filepath.Join(path, "id"), []byte(`1`), 0666); err != nil {
-		return fmt.Errorf("write raft/id: %s", err)
-	}
-	if err := ioutil.WriteFile(filepath.Join(path, "term"), []byte(`1`), 0666); err != nil {
-		return fmt.Errorf("write raft/term: %s", err)
-	}
-
-	// Generate configuration.
-	var rc raft.Config
-	rc.ClusterID = uint64(rand.Int())
-	rc.MaxNodeID = 1
-	rc.AddNode(1, u)
-
-	// Marshal config.
-	f, err := os.Create(filepath.Join(path, "config"))
-	if err != nil {
-		return fmt.Errorf("create config: %s", err)
-	}
-	defer f.Close()
-
-	// Write config.
-	if err := raft.NewConfigEncoder(f).Encode(&rc); err != nil {
-		return fmt.Errorf("encode config: %s", err)
 	}
 
 	return nil

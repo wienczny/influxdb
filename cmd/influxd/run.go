@@ -19,9 +19,9 @@ import (
 	"github.com/influxdb/influxdb/admin"
 	"github.com/influxdb/influxdb/collectd"
 	"github.com/influxdb/influxdb/graphite"
-	"github.com/influxdb/influxdb/messaging"
+
 	"github.com/influxdb/influxdb/opentsdb"
-	"github.com/influxdb/influxdb/raft"
+
 	"github.com/influxdb/influxdb/udp"
 )
 
@@ -40,9 +40,7 @@ func NewRunCommand() *RunCommand {
 }
 
 type Node struct {
-	Broker   *influxdb.Broker
 	DataNode *influxdb.Server
-	raftLog  *raft.Log
 
 	hostname string
 
@@ -98,18 +96,6 @@ func (s *Node) Close() error {
 
 	if s.DataNode != nil {
 		if err := s.DataNode.Close(); err != nil {
-			return err
-		}
-	}
-
-	if s.raftLog != nil {
-		if err := s.raftLog.Close(); err != nil {
-			return err
-		}
-	}
-
-	if s.Broker != nil {
-		if err := s.Broker.Close(); err != nil {
 			return err
 		}
 	}
@@ -320,14 +306,6 @@ func (cmd *RunCommand) Open(config *Config, join string) *Node {
 	}
 	log.Printf("Cluster server listening on %s", cmd.node.ClusterAddr().String())
 
-	// Open broker & raft log, initialize or join as necessary.
-	if cmd.config.Broker.Enabled {
-		cmd.openBroker(joinURLs, h)
-		// If were running as a broker locally, always connect to it since it must
-		// be ready before we can start the data node.
-		joinURLs = []url.URL{*cmd.node.ClusterURL()}
-	}
-
 	var s *influxdb.Server
 	// Open server, initialize or join as necessary.
 	if cmd.config.Data.Enabled {
@@ -473,22 +451,14 @@ func (cmd *RunCommand) Open(config *Config, join string) *Node {
 	if !cmd.config.ReportingDisabled {
 		if cmd.config.Broker.Enabled && cmd.config.Data.Enabled {
 			// Make sure we have a config object b4 we try to use it.
-			if clusterID := cmd.node.Broker.Broker.ClusterID(); clusterID != 0 {
-				go s.StartReportingLoop(clusterID)
-			}
+			go s.StartReportingLoop(s.ClusterID())
 		} else {
 			log.Fatalln("failed to start reporting because not running as a broker and a data node")
 		}
 	}
 
-	if cmd.node.Broker != nil {
-		// have it occasionally tell a data node in the cluster to run continuous queries
-		if cmd.config.ContinuousQuery.Disabled {
-			log.Printf("Not running continuous queries. [continuous_queries].disabled is set to true.")
-		} else {
-			cmd.node.Broker.RunContinuousQueryLoop()
-		}
-	}
+	// TODO make me a service
+	//cmd.node.Broker.RunContinuousQueryLoop()
 
 	if cmd.config.APIAddr() != cmd.config.ClusterAddr() {
 		err := cmd.node.openAPIListener(cmd.config.APIAddr(), h)
@@ -524,105 +494,8 @@ func writePIDFile(path string) {
 	}
 }
 
-// creates and initializes a broker.
-func (cmd *RunCommand) openBroker(brokerURLs []url.URL, h *Handler) {
-	path := cmd.config.BrokerDir()
-	u := cmd.node.ClusterURL()
-	raftTracing := cmd.config.Logging.RaftTracing
-
-	// Create broker
-	b := influxdb.NewBroker()
-	b.TruncationInterval = time.Duration(cmd.config.Broker.TruncationInterval)
-	b.MaxTopicSize = cmd.config.Broker.MaxTopicSize
-	b.MaxSegmentSize = cmd.config.Broker.MaxSegmentSize
-	cmd.node.Broker = b
-
-	// Create raft log.
-	l := raft.NewLog()
-	l.SetURL(*u)
-	l.DebugEnabled = raftTracing
-	b.Log = l
-	cmd.node.raftLog = l
-
-	// Create Raft clock.
-	clk := raft.NewClock()
-	clk.ApplyInterval = time.Duration(cmd.config.Raft.ApplyInterval)
-	clk.ElectionTimeout = time.Duration(cmd.config.Raft.ElectionTimeout)
-	clk.HeartbeatInterval = time.Duration(cmd.config.Raft.HeartbeatInterval)
-	clk.ReconnectTimeout = time.Duration(cmd.config.Raft.ReconnectTimeout)
-	l.Clock = clk
-
-	// Open broker so it can feed last index data to the log.
-	if err := b.Open(path); err != nil {
-		log.Fatalf("failed to open broker at %s : %s", path, err)
-	}
-	log.Printf("broker opened at %s", path)
-
-	// Attach the broker as the finite state machine of the raft log.
-	l.FSM = &messaging.RaftFSM{Broker: b}
-
-	// Open raft log inside broker directory.
-	if err := l.Open(filepath.Join(path, "raft")); err != nil {
-		log.Fatalf("raft: %s", err)
-	}
-
-	// Attach broker and log to handler.
-	h.Broker = b
-	h.Log = l
-
-	// Checks to see if the raft index is 0.  If it's 0, it might be the first
-	// node in the cluster and must initialize or join
-	index, _ := l.LastLogIndexTerm()
-	if index == 0 {
-		// If we have join URLs, then attemp to join the cluster
-		if len(brokerURLs) > 0 {
-			joinLog(l, brokerURLs)
-			return
-		}
-
-		if err := l.Initialize(); err != nil {
-			log.Fatalf("initialize raft log: %s", err)
-		}
-
-		u := b.Broker.URL()
-		log.Printf("initialized broker: %s\n", (&u).String())
-	} else {
-		log.Printf("broker already member of cluster.  Using existing state and ignoring join URLs")
-	}
-}
-
-// joins a raft log to an existing cluster.
-func joinLog(l *raft.Log, brokerURLs []url.URL) {
-	// Attempts to join each server until successful.
-	for _, u := range brokerURLs {
-		if err := l.Join(u); err == raft.ErrInitialized {
-			return
-		} else if err != nil {
-			log.Printf("join: failed to connect to raft cluster: %s: %s", (&u).String(), err)
-		} else {
-			log.Printf("join: connected raft log to %s", (&u).String())
-			return
-		}
-	}
-	log.Fatalf("join: failed to connect raft log to any specified server")
-}
-
 // creates and initializes a server.
 func (cmd *RunCommand) openServer(joinURLs []url.URL) *influxdb.Server {
-
-	// Create messaging client to the brokers.
-	c := influxdb.NewMessagingClient(*cmd.node.ClusterURL())
-	c.SetURLs(joinURLs)
-
-	if err := c.Open(filepath.Join(cmd.config.Data.Dir, messagingClientFile)); err != nil {
-		log.Fatalf("messaging client error: %s", err)
-	}
-
-	// If no URLs exist on the client the return an error since we cannot reach a broker.
-	if len(c.URLs()) == 0 {
-		log.Fatal("messaging client has no broker URLs")
-	}
-
 	// Create and open the server.
 	s := influxdb.NewServer()
 
@@ -636,7 +509,7 @@ func (cmd *RunCommand) openServer(joinURLs []url.URL) *influxdb.Server {
 	s.CommitHash = commit
 
 	// Open server with data directory and broker client.
-	if err := s.Open(cmd.config.Data.Dir, c); err != nil {
+	if err := s.Open(cmd.config.Data.Dir); err != nil {
 		log.Fatalf("failed to open data node: %v", err.Error())
 	}
 	log.Printf("data node(%d) opened at %s", s.ID(), cmd.config.Data.Dir)
