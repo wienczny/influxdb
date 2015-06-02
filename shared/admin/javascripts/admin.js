@@ -1,20 +1,6 @@
 var recentQueries = [];
 var queryPointer = null;
 
-var data = {
-    results: [{
-        series: [{
-            name: "cpu",
-            tags: { host: "server01", region: "us-west" },
-            columns: ["time", "value"],
-            values: [
-                ["2015-01-29T21:51:28.968422294Z", 0.64],
-                ["2015-01-29T21:51:28.968422294Z", 0.64]
-            ]
-        }]
-    }]
-}
-
 var getSeriesFromJSON = function(data) {
     var results = data.results[0].series;
     return results;
@@ -25,6 +11,9 @@ var handleSubmit = function(e) {
     var q = queryElement.value;
 
     var query = $.get("http://localhost:8086/query", {q: q, db: "mydb"}, function() {
+        // TODO: maybe we start a spinner here?
+
+        document.getElementById('alert').innerHTML = "";
         console.log("query sent!");
     });
 
@@ -67,8 +56,14 @@ var handleKeypress = function(e) {
     var queryElement = document.getElementById('query');
     if (recentQueries.length == 0 ) { return }
 
+    // key press up
     if (e.keyCode == 38) {
-        // stash the current query, if there is one?
+        // TODO: stash the current query, if there is one?
+        if (queryPointer == recentQueries.length - 1) {
+            // this is buggy.
+            //recentQueries.push(queryElement.value);
+            //queryPointer = recentQueries.length - 1;
+        }
 
         if (queryPointer != null && queryPointer > 0) {
             queryPointer -= 1;
@@ -76,6 +71,7 @@ var handleKeypress = function(e) {
         }
     }
 
+    // key press down
     if (e.keyCode == 40) {
         if (queryPointer != null && queryPointer < recentQueries.length - 1) {
             queryPointer += 1;
@@ -92,19 +88,11 @@ var QueryError = React.createClass({
 
 var QueryField = React.createClass({
   render: function() {
-    return (
     return React.createElement("form", {id: "query-form"}, 
         React.createElement("div", {className: "form-group"}, 
           React.createElement("input", {type: "text", className: "form-control", id: "query"})
         )
       )
-            
-      <form id="query-form">
-        <div className="form-group">
-          <input type="text" className="form-control" id="query" />
-        </div>
-      </form>
-    )
   },
 
   componentDidMount: function() {
@@ -114,13 +102,12 @@ var QueryField = React.createClass({
     var query = document.getElementById('query');
     query.addEventListener("keydown", handleKeypress);
 
+    document.getElementById('query').focus();
   }
 });
 
 var DataTable = React.createClass({
   render: function() {
-    console.log(this.props.series)
-
     var tables = this.props.series.map(function(series) {
         return React.createElement("div", null, 
             React.createElement("h1", null, series.name), 
@@ -155,9 +142,9 @@ var TableBody = React.createClass({
     }
 });
 
+// TODO: make a deleteable option?
 var TableRow = React.createClass({
     render: function() {
-        console.log("data:", data)
         var tableData = this.props.data.map(function (data) {
             return React.createElement("td", null, data)
         });
@@ -166,10 +153,10 @@ var TableRow = React.createClass({
     }
 });
 
+// TODO: wrap this in a document.ready?
 React.render(
   React.createElement(QueryField, null),
   document.getElementById('content')
 );
 
-document.getElementById('query').focus();
 
