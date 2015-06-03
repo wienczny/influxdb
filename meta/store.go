@@ -241,6 +241,11 @@ func (s *Store) createLocalNode() error {
 	return nil
 }
 
+// IsLeader returns true if this node is currently the leader.
+func (s *Store) IsLeader() bool {
+	return s.raft.VerifyLeader().Error() == nil
+}
+
 // LeaderCh returns a channel that notifies on leadership change.
 // Panics when the store has not been opened yet.
 func (s *Store) LeaderCh() <-chan bool {

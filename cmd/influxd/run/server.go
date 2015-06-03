@@ -8,6 +8,7 @@ import (
 	"github.com/influxdb/influxdb/meta"
 	"github.com/influxdb/influxdb/services/admin"
 	"github.com/influxdb/influxdb/services/collectd"
+	"github.com/influxdb/influxdb/services/continuous_querier"
 	"github.com/influxdb/influxdb/services/graphite"
 	"github.com/influxdb/influxdb/services/httpd"
 	"github.com/influxdb/influxdb/services/opentsdb"
@@ -57,6 +58,7 @@ func NewServer(c *Config, joinURLs string) *Server {
 	s.appendCollectdService(c.Collectd)
 	s.appendOpenTSDBService(c.OpenTSDB)
 	s.appendUDPService(c.UDP)
+	s.appendContinuousQueryService(c.ContinuousQuery)
 	for _, g := range c.Graphites {
 		s.appendGraphiteService(g)
 	}
@@ -116,6 +118,13 @@ func (s *Server) appendUDPService(c udp.Config) {
 	}
 	srv := udp.NewService(c)
 	srv.Server.PointsWriter = s.PointsWriter
+}
+
+func (s *Server) appendContinuousQueryService(c continuous_querier.Config) {
+	srv := continuous_querier.NewService(c)
+	srv.MetaStore = s.MetaStore
+	srv.QueryExecutor = s.QueryExecutor
+	srv.PointsWriter = s.PointsWriter
 	s.Services = append(s.Services, srv)
 }
 
