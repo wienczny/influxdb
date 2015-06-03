@@ -14,7 +14,6 @@ var handleSubmit = function(e) {
         // TODO: maybe we start a spinner here?
 
         document.getElementById('alert').innerHTML = "";
-        console.log("query sent!");
     });
 
     recentQueries.push(q);
@@ -27,6 +26,13 @@ var handleSubmit = function(e) {
               React.createElement(QueryError, {message: response.error}),
               document.getElementById('alert')
             );
+        }
+        else {
+            React.render(
+              React.createElement(QueryError, {message: "Couldn't connect to server: " + e.statusText}),
+              document.getElementById('alert')
+            );
+        
         }
     });
 
