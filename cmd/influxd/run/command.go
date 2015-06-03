@@ -71,25 +71,16 @@ func (cmd *Command) Run(args ...string) error {
 
 	// Override config hostname if specified in the command line args.
 	if options.Hostname != "" {
-		config.Hostname = options.Hostname
-	}
-	// FIXME(benbjohnson): cmd.node.hostname = cmd.config.Hostname
-
-	// Use the config JoinURLs by default
-	// If a -join flag was passed, these should override the config
-	joinURLs := config.Initialization.JoinURLs
-	if options.Join != "" {
-		joinURLs = options.Join
+		config.Meta.Hostname = options.Hostname
 	}
 
-	// Normalize and validate the configuration.
-	config.Normalize()
+	// Validate the configuration.
 	if err := config.Validate(); err != nil {
 		return fmt.Errorf("%s. To generate a valid configuration file run `influxd config > influxdb.generated.conf`.", err)
 	}
 
 	// Create server from config and start it.
-	s := NewServer(config, joinURLs)
+	s := NewServer(config)
 	if err := s.Open(); err != nil {
 		return fmt.Errorf("open server: %s", err)
 	}
