@@ -240,7 +240,14 @@ func (data *Data) ShardGroups(database, policy string) ([]ShardGroupInfo, error)
 	} else if rpi == nil {
 		return nil, ErrRetentionPolicyNotFound
 	}
-	return rpi.ShardGroups, nil
+	groups := make([]ShardGroupInfo, 0, len(rpi.ShardGroups))
+	for _, g := range rpi.ShardGroups {
+		if g.Tombstone {
+			continue
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
 }
 
 // ShardGroupByTimestamp returns the shard group on a database and policy for a given timestamp.
@@ -331,10 +338,10 @@ func (data *Data) DeleteShardGroup(database, policy string, id uint64) error {
 		return ErrRetentionPolicyNotFound
 	}
 
-	// Find shard group by ID and remove it.
+	// Find shard group by ID and set its tombstone.
 	for i := range rpi.ShardGroups {
 		if rpi.ShardGroups[i].ID == id {
-			rpi.ShardGroups = append(rpi.ShardGroups[:i], rpi.ShardGroups[i+1:]...)
+			rpi.ShardGroups[i].Tombstone = true
 			return nil
 		}
 	}
@@ -568,7 +575,7 @@ func NewRetentionPolicyInfo(name string) *RetentionPolicyInfo {
 // ShardGroupByTimestamp returns the shard group in the policy that contains the timestamp.
 func (rpi *RetentionPolicyInfo) ShardGroupByTimestamp(timestamp time.Time) *ShardGroupInfo {
 	for i := range rpi.ShardGroups {
-		if rpi.ShardGroups[i].Contains(timestamp) {
+		if rpi.ShardGroups[i].Contains(timestamp) && !rpi.ShardGroups[i].Tombstone {
 			return &rpi.ShardGroups[i]
 		}
 	}
@@ -609,12 +616,16 @@ func shardGroupDuration(d time.Duration) time.Duration {
 	return 1 * time.Hour
 }
 
-// ShardGroupInfo represents metadata about a shard group.
+// ShardGroupInfo represents metadata about a shard group. The tombstone field is important
+// because it makes it clear that a ShardGroup has been deleted, and allow the system to be
+// sure that a ShardGroup is not simply missing. If the tombstone is set, the system can safely
+// delete any associated shards.
 type ShardGroupInfo struct {
 	ID        uint64
 	StartTime time.Time
 	EndTime   time.Time
 	Shards    []ShardInfo
+	Tombstone bool
 }
 
 // Contains return true if the shard group contains data for the timestamp.
